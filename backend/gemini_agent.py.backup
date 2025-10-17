@@ -1,0 +1,429 @@
+from google.adk import Agent
+from google.genai import types
+from typing import List, Dict, Any, Optional
+import logging
+import json
+from backend.config import settings
+from backend.models import ChatMessage
+
+logger = logging.getLogger(__name__)
+
+
+class GeminiAgent:
+    """Gemini LLM agent using Google Agent Development Kit (ADK) with tool support."""
+    
+    def __init__(self, graph_store=None):
+        """
+        Initialize Gemini ADK agent with tools.
+        
+        Args:
+            graph_store: Optional GraphStore instance for tool functions
+        """
+        self.graph_store = graph_store
+        
+        # Create ADK Agent with tools
+        self.agent = Agent(
+            model=settings.gemini_model,
+            api_key=settings.google_api_key,
+            generation_config={
+                "temperature": settings.temperature,
+                "max_output_tokens": settings.max_tokens
+            },
+            system_instruction="""You are an intelligent AI assistant with access to a GraphRAG knowledge base containing documents and code repositories.
+
+Your capabilities:
+1. **search_knowledge_base**: Search through documents and code using semantic search
+2. **list_documents**: View all available documents and repositories  
+3. **get_document_summary**: Get summary of knowledge base contents
+
+When answering questions:
+- Use the available tools to search the knowledge base when needed
+- Analyze the retrieved context carefully
+- Provide accurate, well-structured responses
+- Cite sources when relevant
+- If information is not in the knowledge base, clearly state that
+- Maintain conversation context
+
+Always be helpful, accurate, and transparent about your knowledge limitations.""",
+            tools=[
+                self._search_knowledge_base_tool,
+                self._list_documents_tool,
+                self._get_document_summary_tool
+            ]
+        )
+        
+        logger.info(f"Initialized Gemini ADK Agent with model: {settings.gemini_model}")
+    
+    # Tool methods for ADK Agent
+    def _search_knowledge_base_tool(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Create ADK tools from MCP-style tool definitions."""
+        # Define search_knowledge_base tool
+        search_kb_declaration = FunctionDeclaration(
+            name="search_knowledge_base",
+            description="Search the GraphRAG knowledge base for relevant information about documents or code. Returns relevant chunks with content and sources.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query or question to find relevant information"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of relevant chunks to retrieve (default: 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }
+        )
+        
+        # Define list_documents tool
+        list_docs_declaration = FunctionDeclaration(
+            name="list_documents",
+            description="List all documents and GitHub repositories in the knowledge base. Shows filenames, types, chunk counts, and metadata.",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        )
+        
+        # Define get_document_summary tool
+        doc_summary_declaration = FunctionDeclaration(
+            name="get_document_summary",
+            description="Get a summary of what types of content are in the knowledge base (documents, code repos, file types, etc.)",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        )
+        
+        # Create Tool object with all function declarations
+        tool = Tool(
+            function_declarations=[
+                search_kb_declaration,
+                list_docs_declaration,
+                doc_summary_declaration
+            ]
+        )
+        
+        return [tool]
+    
+    def _execute_tool(self, function_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a tool function and return results."""
+        try:
+            if function_name == "search_knowledge_base":
+                return self._tool_search_knowledge_base(**arguments)
+            elif function_name == "list_documents":
+                return self._tool_list_documents()
+            elif function_name == "get_document_summary":
+                return self._tool_get_document_summary()
+            else:
+                return {"error": f"Unknown tool: {function_name}"}
+        except Exception as e:
+            logger.error(f"Error executing tool {function_name}: {e}")
+            return {"error": str(e)}
+    
+    def _tool_search_knowledge_base(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Tool implementation: Search knowledge base."""
+        if not self.graph_store:
+            return {"error": "Graph store not available"}
+        
+        try:
+            from backend.embeddings import embedding_service
+            
+            # Generate query embedding
+            query_embedding = embedding_service.embed_text(query)
+            
+            # Search for relevant chunks
+            chunks = self.graph_store.vector_search(query_embedding, top_k=top_k)
+            
+            # Format results
+            results = []
+            for chunk in chunks:
+                result = {
+                    "content": chunk.get("content", "")[:500],  # Limit content length
+                    "filename": chunk.get("filename", "Unknown"),
+                    "score": chunk.get("score", 0.0)
+                }
+                if chunk.get("file_path"):
+                    result["file_path"] = chunk["file_path"]
+                if chunk.get("language"):
+                    result["language"] = chunk["language"]
+                results.append(result)
+            
+            return {
+                "query": query,
+                "results_count": len(results),
+                "results": results
+            }
+        except Exception as e:
+            return {"error": f"Search failed: {str(e)}"}
+    
+    def _tool_list_documents(self) -> Dict[str, Any]:
+        """Tool implementation: List all documents."""
+        if not self.graph_store:
+            return {"error": "Graph store not available"}
+        
+        try:
+            docs = self.graph_store.get_all_documents()
+            
+            documents = []
+            for doc in docs:
+                doc_info = {
+                    "filename": doc["filename"],
+                    "chunk_count": doc.get("chunk_count", 0)
+                }
+                if doc.get("repo_url"):
+                    doc_info["type"] = "github_repository"
+                    doc_info["repo_url"] = doc["repo_url"]
+                    doc_info["file_count"] = doc.get("file_count", 0)
+                else:
+                    doc_info["type"] = "document"
+                documents.append(doc_info)
+            
+            return {
+                "total_documents": len(documents),
+                "documents": documents
+            }
+        except Exception as e:
+            return {"error": f"Failed to list documents: {str(e)}"}
+    
+    def _tool_get_document_summary(self) -> Dict[str, Any]:
+        """Tool implementation: Get knowledge base summary."""
+        if not self.graph_store:
+            return {"error": "Graph store not available"}
+        
+        try:
+            docs = self.graph_store.get_all_documents()
+            
+            total_chunks = sum(doc.get("chunk_count", 0) for doc in docs)
+            github_repos = [doc for doc in docs if doc.get("repo_url")]
+            regular_docs = [doc for doc in docs if not doc.get("repo_url")]
+            
+            return {
+                "total_documents": len(docs),
+                "total_chunks": total_chunks,
+                "github_repositories": len(github_repos),
+                "regular_documents": len(regular_docs),
+                "repo_names": [doc.get("repo_name", "Unknown") for doc in github_repos],
+                "document_names": [doc["filename"] for doc in regular_docs]
+            }
+        except Exception as e:
+            return {"error": f"Failed to get summary: {str(e)}"}
+    
+    def _format_context(self, retrieved_chunks: List[Dict[str, Any]]) -> str:
+        """Format retrieved chunks into context for the LLM."""
+        if not retrieved_chunks:
+            return "No relevant context found."
+        
+        context_parts = []
+        for idx, chunk in enumerate(retrieved_chunks, 1):
+            context_parts.append(
+                f"[Source {idx} - {chunk.get('filename', 'Unknown')}]\n"
+                f"{chunk.get('content', '')}\n"
+            )
+        
+        return "\n".join(context_parts)
+    
+    def _build_messages(
+        self,
+        query: str,
+        context: str,
+        conversation_history: Optional[List[ChatMessage]] = None
+    ) -> List[Content]:
+        """Build message history for the agent."""
+        messages = []
+        
+        # Add conversation history if available
+        if conversation_history:
+            for msg in conversation_history[-5:]:  # Last 5 messages
+                role = "user" if msg.role == "user" else "model"
+                messages.append(
+                    Content(
+                        role=role,
+                        parts=[Part(text=msg.content)]
+                    )
+                )
+        
+        # Add current query with context
+        user_message = f"""Context from documents:
+{context}
+
+Question: {query}"""
+        
+        messages.append(
+            Content(
+                role="user",
+                parts=[Part(text=user_message)]
+            )
+        )
+        
+        return messages
+    
+    async def generate_response(
+        self,
+        query: str,
+        retrieved_chunks: List[Dict[str, Any]] = None,
+        conversation_history: Optional[List[ChatMessage]] = None
+    ) -> str:
+        """
+        Generate a response using Gemini ADK agent with tool support.
+        
+        The agent can autonomously decide to use tools (search_knowledge_base, list_documents, etc.)
+        or use the provided retrieved_chunks directly.
+        """
+        try:
+            logger.info(f"Generating response for query: {query[:100]}...")
+            
+            # Build initial message
+            messages = []
+            
+            # Add conversation history if available
+            if conversation_history:
+                for msg in conversation_history[-5:]:
+                    role = "user" if msg.role == "user" else "model"
+                    messages.append(
+                        Content(
+                            role=role,
+                            parts=[Part(text=msg.content)]
+                        )
+                    )
+            
+            # Add current query
+            if retrieved_chunks:
+                # If chunks provided, include them as context
+                context = self._format_context(retrieved_chunks)
+                user_message = f"""Context from knowledge base:
+{context}
+
+Question: {query}"""
+            else:
+                # Let agent decide whether to use tools
+                user_message = query
+            
+            messages.append(
+                Content(
+                    role="user",
+                    parts=[Part(text=user_message)]
+                )
+            )
+            
+            # Generate response with tool support
+            response = self.client.models.generate_content(
+                model=settings.gemini_model,
+                contents=messages,
+                config=self.agent_config
+            )
+            
+            # Handle tool calls if any
+            max_iterations = 5
+            iteration = 0
+            
+            while iteration < max_iterations:
+                # Check if response contains function calls
+                if response.candidates and response.candidates[0].content.parts:
+                    parts = response.candidates[0].content.parts
+                    
+                    # Check for function calls
+                    function_calls = [part for part in parts if hasattr(part, 'function_call') and part.function_call]
+                    
+                    if not function_calls:
+                        # No more function calls, return the text response
+                        break
+                    
+                    # Execute function calls
+                    messages.append(response.candidates[0].content)
+                    
+                    for part in function_calls:
+                        function_call = part.function_call
+                        function_name = function_call.name
+                        function_args = dict(function_call.args) if function_call.args else {}
+                        
+                        logger.info(f"Agent calling tool: {function_name} with args: {function_args}")
+                        
+                        # Execute the tool
+                        tool_result = self._execute_tool(function_name, function_args)
+                        
+                        # Add function response
+                        function_response = Content(
+                            role="function",
+                            parts=[
+                                Part(
+                                    function_response=FunctionResponse(
+                                        name=function_name,
+                                        response={"result": json.dumps(tool_result)}
+                                    )
+                                )
+                            ]
+                        )
+                        messages.append(function_response)
+                    
+                    # Continue the conversation with function results
+                    response = self.client.models.generate_content(
+                        model=settings.gemini_model,
+                        contents=messages,
+                        config=self.agent_config
+                    )
+                    
+                    iteration += 1
+                else:
+                    break
+            
+            # Extract final text response
+            if response and response.text:
+                return response.text
+            else:
+                return "I apologize, but I couldn't generate a response. Please try again."
+            
+        except Exception as e:
+            logger.error(f"Error generating response with Gemini ADK: {e}")
+            raise
+    
+    async def generate_summary(self, text: str) -> str:
+        """Generate a summary of the given text."""
+        try:
+            prompt = f"""Please provide a concise summary of the following text:
+
+{text}
+
+Summary:"""
+            
+            response = self.client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[Content(role="user", parts=[Part(text=prompt)])],
+                config=self.agent_config
+            )
+            return response.text if response and response.text else "Unable to generate summary."
+            
+        except Exception as e:
+            logger.error(f"Error generating summary: {e}")
+            raise
+    
+    async def extract_entities(self, text: str) -> List[str]:
+        """Extract key entities from the text."""
+        try:
+            prompt = f"""Extract the key entities (people, organizations, locations, concepts) from the following text.
+Return them as a comma-separated list.
+
+Text: {text}
+
+Entities:"""
+            
+            response = self.client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[Content(role="user", parts=[Part(text=prompt)])],
+                config=self.agent_config
+            )
+            
+            if response and response.text:
+                entities = [e.strip() for e in response.text.split(',')]
+                return entities
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error extracting entities: {e}")
+            return []
